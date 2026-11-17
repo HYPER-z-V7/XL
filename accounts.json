@@ -1,26 +1,129 @@
-[
-  {
-    "uid": "REPLACE_ME_1",
-    "password": "RAI X",
-    "region": "BD",
-    "clan_id": "3107287025D"
-  },
-  {
-    "uid": "REPLACE_ME_2",
-    "password": "RAI X",
-    "region": "BD",
-    "clan_id": "3107287025"
-  },
-  {
-    "uid": "REPLACE_ME_3",
-    "password": "RAI X",
-    "region": "BD",
-    "clan_id": "3107287025"
-  },
-  {
-    "uid": "REPLACE_ME_4",
-    "password": "RAI X",
-    "region": "BD",
-    "clan_id": "3107287025"
-  }
-]
+#!/usr/bin/env python3
+"""RAI X guest account generator -> accounts.json"""
+import asyncio, hashlib, hmac, json, os, random, sys, time, uuid
+import aiohttp
+
+IDENTITY   = "RAI X"           # password field
+NICK_PREFIX = "RAI"            # nickname (ঐচ্ছিক ধাপে ব্যবহৃত)
+REGION     = os.getenv("FF_REGION", "BD")
+CLAN_ID    = os.getenv("FF_CLAN_ID", "3107287025")
+COUNT      = int(os.getenv("FF_COUNT", "4"))
+OUT        = "accounts.json"
+CONCURRENCY = 3
+
+HEX_KEY = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
+API_KEY = HEX_KEY.encode()
+UA = "GarenaMSDK/4.0.44(SM-E135F ;Android 14;en;GB;app {v} 2019118525;)"
+
+def sig(payload: str) -> str:
+    return hmac.new(API_KEY, payload.encode(), hashlib.sha256).hexdigest()
+
+def headers(v: str) -> dict:
+    return {"User-Agent": UA.format(v=v), "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8"}
+
+async def app_version(s):
+    try:
+        async with s.get("https://version.ggwhitehawk.com/live/ver.php",
+                         params={"version": "1.132.9", "lang": "en", "device": "android",
+                                 "channel": "android", "appstore": "googleplay",
+                                 "region": REGION, "whitelist_version": "1.3.0",
+                                 "whitelist_sp_version": "1.0.0"},
+                         timeout=aiohttp.ClientTimeout(total=20)) as r:
+            j = await r.json()
+            return j.get("gop_url", "").split(";")[0].strip() or None
+    except Exception as e:
+        print(f"[VER] {e}")
+        return None
+
+async def register(s, gop, ver, sem):
+    async with sem:
+        body = json.dumps({"app_id": 100067, "client_type": 2,
+                           "password": IDENTITY, "source": 2},
+                          separators=(",", ":"))
+        h = headers(ver); h["Authorization"] = f"Signature {sig(body)}"
+        try:
+            async with s.post(f"{gop}/api/v2/oauth/guest:register", data=body,
+                              headers=h, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                j = await r.json(content_type=None)
+                if j.get("code") == 0:
+                    return str(j["data"]["uid"])
+                print(f"[REG] code={j.get('code')} {j.get('message','')}")
+        except Exception as e:
+            print(f"[REG] {e}")
+        return None
+
+async def verify(s, gop, ver, uid, sem):
+    async with sem:
+        body = json.dumps({"client_id": 100067, "client_secret": HEX_KEY,
+                           "client_type": 2, "device_id": f"02-{uuid.uuid4()}",
+                           "password": IDENTITY, "response_type": "token",
+                           "uid": int(uid)}, separators=(",", ":"))
+        h = headers(ver); h["Authorization"] = f"Signature {sig(body)}"
+        try:
+            async with s.post(f"{gop}/api/v2/oauth/guest/token:grant", data=body,
+                              headers=h, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                j = await r.json(content_type=None)
+                return j.get("code") == 0 and bool(j.get("data", {}).get("access_token"))
+        except Exception:
+            return False
+
+def load():
+    if not os.path.exists(OUT):
+        return []
+    try:
+        with open(OUT, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save(rows):
+    tmp = OUT + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2)
+    os.replace(tmp, OUT)
+
+async def main():
+    sem = asyncio.Semaphore(CONCURRENCY)
+    async with aiohttp.ClientSession() as s:
+        gop = await app_version(s)
+        if not gop:
+            print("gop_url পাওয়া যায়নি — নেট বা version URL চেক করো"); return
+        print(f"gop={gop} region={REGION} count={COUNT}")
+
+        rows = load()
+        have = {r.get("uid") for r in rows}
+        ok = 0
+
+        async def one(i):
+            nonlocal ok
+            uid = await register(s, gop, "1.132.9", sem)
+            if not uid or uid in have:
+                print(f"[{i}] ফেইল"); return
+            if not await verify(s, gop, "1.132.9", uid, sem):
+                print(f"[{i}] {uid} ভেরিফাই ফেইল, বাদ"); return
+            have.add(uid); ok += 1
+            rows.append({"uid": uid, "password": IDENTITY,
+                         "region": REGION, "clan_id": CLAN_ID})
+            save(rows)
+            print(f"[{i}] OK {uid}")
+
+        await asyncio.gather(*[one(i + 1) for i in range(COUNT)])
+        print(f"\nমোট {ok}/{COUNT} সফল, {OUT}-এ {len(rows)}টা আছে")
+        print("পরে নিকনেম বসাতে: python gen_accounts.py --nick")
+
+async def nick(rows):
+    """ঐচ্ছিক: রিপো ক্লোন করা থাকলে major_register দিয়ে RAI-XXXXXX নিকনেম বসায়"""
+    import importlib.util
+    if not os.path.exists("main.py"):
+        print("main.py পাশে নেই — রিপো ক্লোন করে এখানেই রাখো"); return
+    spec = importlib.util.spec_from_file_location("ffmain", "main.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    print(f"{len(rows)}টা একাউন্টে নিকনেম বসানো হবে")
+
+if __name__ == "__main__":
+    if "--nick" in sys.argv:
+        asyncio.run(nick(load()))
+    else:
+        asyncio.run(main())
